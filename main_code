@@ -1,0 +1,267 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <LiquidCrystal_I2C.h>
+
+// --- Matériel ---
+// Moteur DC via L298N
+const int motorPin1 = 2;
+const int motorPin2 = 3;
+const int motorPWM = 5;
+
+// Boutons
+const int button1Pin = 6;
+const int button2Pin = 7;
+const int button3Pin = 8;
+
+// Buzzer
+const int buzzerPin = 9;  // Broche du buzzer
+
+// Capteur BNO055
+Adafruit_BNO055 bno = Adafruit_BNO055();
+
+// Écran LCD I2C
+LiquidCrystal_I2C lcd(0x3F, 16, 2);
+
+// --- État système ---
+float desiredHeading = 0;
+bool autoCorrection = false;
+bool systemOn = false;
+
+// --- Détection appuis ---
+unsigned long button1PressTime = 0;
+unsigned long button2PressTime = 0;
+unsigned long button3PressTime = 0;
+
+// --- PID ---
+float Kp = 5.0;
+float Ki = 0.0;
+float Kd = 0.0;
+float previousError = 0;
+float integral = 0;
+unsigned long lastPIDTime = 0;
+
+// --- Sécurité moteur ---
+const int currentSensorPin = A0;  // Pin du capteur de courant
+const float currentThreshold = 2.0;  // Seuil de courant pour alarme
+float motorCurrent = 0.0;
+
+void setup() {
+  pinMode(motorPin1, OUTPUT);
+  pinMode(motorPin2, OUTPUT);
+  pinMode(motorPWM, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+
+  pinMode(button1Pin, INPUT_PULLUP);
+  pinMode(button2Pin, INPUT_PULLUP);
+  pinMode(button3Pin, INPUT_PULLUP);
+
+  lcd.begin();
+  lcd.backlight();
+
+  Serial.begin(9600);
+  if (!bno.begin()) {
+    Serial.println("Erreur capteur BNO055");
+    while (1);
+  }
+
+  delay(1000); // stabilisation capteur
+}
+
+void loop() {
+  handleButtons();
+
+  // Lecture cap
+  sensors_event_t event;
+  bno.getEvent(&event);
+  float heading = event.orientation.x;
+
+  // Affichage
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Cible: ");
+  lcd.print(desiredHeading, 0);
+  lcd.setCursor(0, 1);
+  lcd.print("Actuel: ");
+  lcd.print(heading, 0);
+
+  Serial.print("System ON: ");
+  Serial.print(systemOn);
+  Serial.print(" | Auto: ");
+  Serial.print(autoCorrection);
+  Serial.print(" | Cap: ");
+  Serial.print(heading);
+  Serial.print(" | Cible: ");
+  Serial.println(desiredHeading);
+
+  // Appliquer la correction PID si nécessaire
+  if (systemOn && autoCorrection) {
+    applyPIDCorrection(heading);
+  }
+
+  // Vérifier la sécurité moteur
+  checkMotorCurrent();
+
+  delay(100);
+}
+
+void handleButtons() {
+  int b1 = digitalRead(button1Pin);
+  int b2 = digitalRead(button2Pin);
+  int b3 = digitalRead(button3Pin);
+  unsigned long now = millis();
+
+  // --- Appuis combinés ---
+  if (b1 == LOW && b2 == LOW && systemOn) {
+    desiredHeading += 100;
+    waitRelease();
+    shortBeep(); return;
+  }
+  if (b2 == LOW && b3 == LOW && systemOn) {
+    desiredHeading -= 100;
+    waitRelease();
+    shortBeep(); return;
+  }
+
+  // --- Bouton 1 ---
+  if (b1 == LOW) {
+    if (button1PressTime == 0) button1PressTime = now;
+  } else if (button1PressTime > 0) {
+    unsigned long duration = now - button1PressTime;
+    if (systemOn) {
+      desiredHeading += (duration > 500) ? 10 : 1;
+    } else {
+      runMotorClockwise((duration > 500) ? 3 : 1);
+    }
+    button1PressTime = 0;
+    shortBeep();
+  }
+
+  // --- Bouton 2 ---
+  if (b2 == LOW) {
+    if (button2PressTime == 0) button2PressTime = now;
+  } else if (button2PressTime > 0) {
+    unsigned long duration = now - button2PressTime;
+    if (duration > 100) {
+      systemOn = !systemOn;
+      autoCorrection = systemOn;
+
+      if (systemOn) {
+        sensors_event_t event;
+        bno.getEvent(&event);
+        desiredHeading = event.orientation.x;
+      }
+    }
+    button2PressTime = 0;
+    shortBeep();
+  }
+
+  // --- Bouton 3 ---
+  if (b3 == LOW) {
+    if (button3PressTime == 0) button3PressTime = now;
+  } else if (button3PressTime > 0) {
+    unsigned long duration = now - button3PressTime;
+    if (systemOn) {
+      desiredHeading -= (duration > 500) ? 10 : 1;
+    } else {
+      runMotorCounterClockwise((duration > 500) ? 3 : 1);
+    }
+    button3PressTime = 0;
+    shortBeep();
+  }
+}
+
+// Fonction de court bip (appui bref)
+void shortBeep() {
+  tone(buzzerPin, 1000, 200);  // Fréquence 1000 Hz, durée 200 ms
+  delay(250);  // Attente pour éviter le chevauchement des bips
+}
+
+// Fonction de double bip (appui long)
+void doubleBeep() {
+  tone(buzzerPin, 1000, 200);  // Fréquence 1000 Hz, durée 200 ms
+  delay(250);
+  tone(buzzerPin, 1000, 200);  // Un autre bip
+  delay(250);
+}
+
+// === Sécurité moteur ===
+void checkMotorCurrent() {
+  motorCurrent = analogRead(currentSensorPin) * (5.0 / 1024.0); // Lecture du courant
+
+  if (motorCurrent > currentThreshold) {
+    alertMotorOverload();
+    stopMotor();
+  }
+}
+
+// Fonction d'alarme moteur (bip long)
+void alertMotorOverload() {
+  tone(buzzerPin, 500, 1000);  // Alerte avec un bip long
+}
+
+// Fonction pour arrêter le moteur
+void stopMotor() {
+  digitalWrite(motorPin1, LOW);
+  digitalWrite(motorPin2, LOW);
+  analogWrite(motorPWM, 0);
+}
+
+// === PID CORRECTION ===
+void applyPIDCorrection(float heading) {
+  float error = desiredHeading - heading;
+
+  if (error > 180) error -= 360;
+  if (error < -180) error += 360;
+
+  unsigned long now = millis();
+  float deltaTime = (now - lastPIDTime) / 1000.0;
+  lastPIDTime = now;
+
+  integral += error * deltaTime;
+  float derivative = (error - previousError) / deltaTime;
+  float output = Kp * error + Ki * integral + Kd * derivative;
+  previousError = error;
+
+  if (abs(error) > 2) {
+    int pwm = constrain(abs(output), 100, 255);
+
+    if (output > 0) {
+      digitalWrite(motorPin1, HIGH);
+      digitalWrite(motorPin2, LOW);
+    } else {
+      digitalWrite(motorPin1, LOW);
+      digitalWrite(motorPin2, HIGH);
+    }
+
+    analogWrite(motorPWM, pwm);
+    delay(50);
+    analogWrite(motorPWM, 0);
+  }
+}
+
+// === Commande manuelle moteur ===
+void runMotorClockwise(int sec) {
+  digitalWrite(motorPin1, HIGH);
+  digitalWrite(motorPin2, LOW);
+  analogWrite(motorPWM, 255);
+  delay(sec * 1000);
+  analogWrite(motorPWM, 0);
+}
+
+void runMotorCounterClockwise(int sec) {
+  digitalWrite(motorPin1, LOW);
+  digitalWrite(motorPin2, HIGH);
+  analogWrite(motorPWM, 255);
+  delay(sec * 1000);
+  analogWrite(motorPWM, 0);
+}
+
+// === Attente relâchement boutons ===
+void waitRelease() {
+  while (digitalRead(button1Pin) == LOW ||
+         digitalRead(button2Pin) == LOW ||
+         digitalRead(button3Pin) == LOW) {
+    delay(10);
+  }
+}
